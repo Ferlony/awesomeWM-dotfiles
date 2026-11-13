@@ -17,10 +17,27 @@ local utils = require("awesome-wm-widgets.volume-widget.utils")
 
 
 local LIST_DEVICES_CMD = [[sh -c "pacmd list-sinks; pacmd list-sources"]]
-local function GET_VOLUME_CMD(device) return 'amixer -D ' .. device .. ' sget Master' end
-local function INC_VOLUME_CMD(device, step) return 'amixer -D ' .. device .. ' sset Master ' .. step .. '%+' end
-local function DEC_VOLUME_CMD(device, step) return 'amixer -D ' .. device .. ' sset Master ' .. step .. '%-' end
-local function TOG_VOLUME_CMD(device) return 'amixer -D ' .. device .. ' sset Master toggle' end
+local SINK = '@DEFAULT_AUDIO_SINK@'
+local GET_RAW = 'pactl get-sink-volume @DEFAULT_SINK@; pactl get-sink-mute @DEFAULT_SINK@'
+local GET = 'sh -c "' .. GET_RAW .. '"'
+local function GET_VOLUME_CMD(device) return GET end
+local function parse_db(out) -- nil = -inf
+    local db = tonumber(string.match(out, "/%s*([%-%w%.]+) dB"))
+    if db and db > -math.huge then return db end
+end
+local MAX = 10 ^ (11 / 60) -- +11 dB = 100% 
+local DB_STEP = 2   
+local DB_MIN  = -60 
+local function step_db(delta, cb)
+    spawn.easy_async(GET, function(out)
+        local db = parse_db(out) or DB_MIN - DB_STEP
+        db = math.floor(db / DB_STEP + 0.5) * DB_STEP + delta
+        db = math.min(db, 11)
+        local nv = db < DB_MIN and 0 or 10 ^ (db / 60)
+        spawn.easy_async(string.format('sh -c "wpctl set-volume %s %.6f; %s"', SINK, nv, GET_RAW), cb)
+    end)
+end
+local function TOG_VOLUME_CMD(device) return 'sh -c "wpctl set-mute ' .. SINK .. ' toggle; ' .. GET_RAW .. '"' end
 
 
 local widget_types = {
@@ -176,21 +193,24 @@ local function worker(user_args)
     end
 
     local function update_graphic(widget, stdout)
-        local mute = string.match(stdout, "%[(o%D%D?)%]")   -- \[(o\D\D?)\] - [on] or [off]
-        if mute == 'off' then widget:mute()
-        elseif mute == 'on' then widget:unmute()
-        end
-        local volume_level = string.match(stdout, "(%d?%d?%d)%%") -- (\d?\d?\d)\%)
-        volume_level = string.format("% 3d", volume_level)
+        if not string.find(stdout, "dB") then return end
+        if string.find(stdout, "Mute: yes") then widget:mute() else widget:unmute() end
+        local db = parse_db(stdout)
+        local v = db and 10 ^ (db / 60) or 0
+        local volume_level = string.format("% 3d", math.floor(v / MAX * 100 + 0.5))
         widget:set_volume_level(volume_level)
+        local txt = widget:get_children_by_id('txt')[1]
+        if txt then
+            txt:set_text(db and string.format("%+.1f dB", db) or "-∞ dB")
+        end
     end
 
     function volume:inc(s)
-        spawn.easy_async(INC_VOLUME_CMD(device, s or step), function(stdout) update_graphic(volume.widget, stdout) end)
+        step_db(DB_STEP, function(stdout) update_graphic(volume.widget, stdout) end)
     end
 
     function volume:dec(s)
-        spawn.easy_async(DEC_VOLUME_CMD(device, s or step), function(stdout) update_graphic(volume.widget, stdout) end)
+        step_db(-DB_STEP, function(stdout) update_graphic(volume.widget, stdout) end)
     end
 
     function volume:toggle()
